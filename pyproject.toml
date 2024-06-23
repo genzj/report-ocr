@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "report-ocr"
+version = "0.1.0"
+description = ""
+authors = ["genzj <zj0512@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+cnocr = "^2.3.0.3"
+pdf2image = "^1.17.0"
+onnxruntime = "^1.18.0"
+numpy = "<2"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
