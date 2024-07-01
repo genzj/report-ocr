@@ -1,8 +1,8 @@
 import heapq
 import logging
 import typing
-from csv import writer as csv_writer
 from contextlib import contextmanager
+from csv import writer as csv_writer
 from dataclasses import dataclass, field
 from enum import Enum
 from logging import basicConfig, getLogger
@@ -29,7 +29,8 @@ class Orientation(Enum):
         return 0 if self == Orientation.VERTICAL else 1
 
     def to_sort_index(self) -> int:
-        """elements in a vertical group are sorted by their Y position, vice versa"""
+        """elements in a vertical group are sorted by their Y position,
+        vice versa"""
         return 1 if self == Orientation.VERTICAL else 0
 
     def calc_core(self, result: OcrResult) -> float:
@@ -67,6 +68,9 @@ class Group:
         self.add(result)
         return True
 
+    def write(self, csv: typing.Any):
+        csv.writerow(ele.text for _, ele in sorted(self.results))
+
 
 @contextmanager
 def pdf_first_page(pdf: str | Path) -> typing.Iterator[Path]:
@@ -98,7 +102,9 @@ def ocr_first_page(ocr: CnOcr, pdf: str | Path) -> list[OcrResult]:
         raise
 
 
-def ocr_all_pdfs( data_dir: str | Path = "data") -> typing.Iterator[tuple[Path, list[OcrResult]]]:
+def ocr_all_pdfs(
+    data_dir: str | Path = "data",
+) -> typing.Iterator[tuple[Path, list[OcrResult]]]:
     data_dir = Path(data_dir)
     if not data_dir.is_dir:
         raise ValueError("data_dir must be a dir")
@@ -115,7 +121,7 @@ def ensure_output_dir(output_dir: str | Path) -> Path:
     if not output_dir.is_dir:
         raise ValueError("output must be a dir")
     return output_dir
-    
+
 
 def ocr_to_txt(
     data_dir: str | Path = "data", output_dir: str | Path = "output"
@@ -143,11 +149,11 @@ def ocr_to_csv(
             for result in results:
                 if group.try_add(result):
                     continue
-                csv.writerow(ele.text for _, ele in sorted(group.results))
+                group.write(csv)
                 group = Group(Orientation.HORIZONTAL)
                 group.add(result)
             # don't forget to write the last group
-            csv.writerow(ele.text for _, ele in sorted(group.results))
+            group.write(csv)
 
 
 if __name__ == "__main__":
