@@ -20,6 +20,12 @@ DEFAULT_OCR_MODEL = "densenet_lite_136-gru"
 L = getLogger("report_ocr")
 
 
+class GroupingResult(Enum):
+    FIT = 0  # Right in the group
+    INSUFFICIENT = 1  # Left (horizontal) to or above (vertical) the group
+    SURPLUS = 2  # Right (horizontal) to or below (vertical) the group
+
+
 class Orientation(Enum):
     HORIZONTAL = 1
     VERTICAL = 2
@@ -41,18 +47,30 @@ class Orientation(Enum):
         position = cast(ndarray, result.position)
         return position[:, self.to_sort_index()].mean()
 
+    @property
+    def orthogonal(self) -> "Orientation":
+        return (
+            Orientation.HORIZONTAL
+            if self == Orientation.VERTICAL
+            else Orientation.VERTICAL
+        )
+
 
 @dataclass
 class Group:
     orientation: Orientation
-    tolerance: float = 5
+    tolerance: float = 8
     baseline: float = 0
     results: list[tuple[float, OcrResult]] = field(default_factory=list)
 
-    def is_same_group(self, result: OcrResult) -> bool:
+    def is_same_group(self, result: OcrResult) -> GroupingResult:
+        diff = self.orientation.calc_core(result) - self.baseline
+        if abs(diff) <= self.tolerance:
+            return GroupingResult.FIT
         return (
-            abs(self.baseline - self.orientation.calc_core(result))
-            <= self.tolerance
+            GroupingResult.INSUFFICIENT
+            if diff < 0
+            else GroupingResult.SURPLUS
         )
 
     def add(self, result: OcrResult):
@@ -63,13 +81,55 @@ class Group:
         heapq.heappush(self.results, (weight, result))
 
     def try_add(self, result: OcrResult) -> bool:
-        if not self.is_same_group(result):
+        if self.results and self.is_same_group(result) != GroupingResult.FIT:
             return False
         self.add(result)
         return True
 
     def write(self, csv: typing.Any):
         csv.writerow(ele.text for _, ele in sorted(self.results))
+
+
+class LinearGrouper:
+    groups: list[Group]
+    orientation: Orientation
+    tolerance: float
+
+    def __init__(
+        self,
+        orientation: Orientation,
+        tolerance: float,
+    ) -> None:
+        self.groups = []
+        self.orientation = orientation
+        self.tolerance = tolerance
+
+    def group(self, results: list[OcrResult]):
+        group_idx = 0
+        for result in results:
+            while (
+                len(self.groups) > group_idx
+                and self.groups[group_idx].is_same_group(result)
+                == GroupingResult.SURPLUS
+            ):
+                group_idx += 1
+
+            if len(self.groups) <= group_idx:
+                self.groups.append(
+                    Group(self.orientation, tolerance=self.tolerance)
+                )
+
+            if self.groups[group_idx].try_add(result):
+                continue
+            else:
+                assert (
+                    self.groups[group_idx].is_same_group(result)
+                    == GroupingResult.INSUFFICIENT
+                )
+                new_group = Group(self.orientation, tolerance=self.tolerance)
+                new_group.add(result)
+                self.groups.insert(group_idx, new_group)
+                group_idx += 1
 
 
 @contextmanager
@@ -135,6 +195,102 @@ def ocr_to_txt(
             output.writelines(str(result) + "\n" for result in results)
 
 
+@dataclass
+class TableOcrResult:
+    col_idx: int
+    row_idx: int
+    result: OcrResult
+
+    @property
+    def sort_key(self) -> tuple[int, int]:
+        return (self.row_idx, self.col_idx)
+
+
+def table_layout(
+    results: list[OcrResult], row_tolerance: float, column_tolerance: float
+) -> list[TableOcrResult]:
+    result_to_position: dict[int, TableOcrResult] = dict()
+    rows = [Group(Orientation.HORIZONTAL, row_tolerance)]
+    row = rows[0]
+    row_idx = 0
+    for result in results:
+        if row.try_add(result):
+            result_to_position[id(result)] = TableOcrResult(
+                -1, row_idx, result
+            )
+            continue
+        row_idx += 1
+        row = Group(Orientation.HORIZONTAL, row_tolerance)
+        row.add(result)
+        result_to_position[id(result)] = TableOcrResult(-1, row_idx, result)
+        rows.append(row)
+
+    column_grouper = LinearGrouper(Orientation.VERTICAL, column_tolerance)
+    for row in rows:
+        column_grouper.group([r for _, r in sorted(row.results)])
+
+    for col_idx, column in enumerate(column_grouper.groups):
+        try:
+            for _, result in column.results:
+                result_to_position[id(result)].col_idx = col_idx
+        except TypeError:
+            L.exception("bad %s", column)
+            L.error("%s", [type(r) for r in column.results])
+            L.error("%s", [w for w, _ in column.results])
+            raise
+
+    return sorted(result_to_position.values(), key=lambda r: r.sort_key)
+
+
+def table_text_iter(
+    results: list[TableOcrResult],
+    score_threshold: float = 0,
+    placeholder: str = "",
+) -> typing.Iterable[typing.Iterable[str]]:
+    row: list[TableOcrResult] = []
+    prev: typing.Optional[TableOcrResult] = None
+
+    for r in results:
+        if prev is None:
+            prev = r
+            row.append(r)
+            continue
+
+        if prev.row_idx != r.row_idx:
+            yield [
+                (
+                    cell.result.text
+                    if cell.result.score >= score_threshold
+                    else placeholder
+                )
+                for cell in row
+            ]
+            prev = r
+            row = [r]
+            continue
+
+        while prev.col_idx < r.col_idx - 1:
+            L.debug("filling between %s and %s", prev.col_idx, r.col_idx)
+            fill = TableOcrResult(
+                prev.col_idx + 1, prev.row_idx, OcrResult(placeholder, 1)
+            )
+            row.append(fill)
+            prev = fill
+
+        row.append(r)
+        prev = r
+
+    if row:
+        yield [
+            (
+                cell.result.text
+                if cell.result.score >= score_threshold
+                else placeholder
+            )
+            for cell in row
+        ]
+
+
 def ocr_to_csv(
     data_dir: str | Path = "data", output_dir: str | Path = "output"
 ):
@@ -145,22 +301,20 @@ def ocr_to_csv(
         output_name = output_dir / Path(pdf.with_suffix(".csv").name)
         with output_name.open("w", encoding="utf-8") as output:
             csv = csv_writer(output)
-            group = Group(Orientation.HORIZONTAL)
-            for result in results:
-                if group.try_add(result):
-                    continue
-                group.write(csv)
-                group = Group(Orientation.HORIZONTAL)
-                group.add(result)
-            # don't forget to write the last group
-            group.write(csv)
+            table_results = table_layout(
+                results,
+                row_tolerance=8,
+                column_tolerance=78,
+            )
+            for row in table_text_iter(table_results, 0.3):
+                csv.writerow(row)
 
 
 if __name__ == "__main__":
     basicConfig(
-        level=logging.DEBUG,
+        level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         force=True,
     )
-    ocr_to_txt()
+    # ocr_to_txt()
     ocr_to_csv()
