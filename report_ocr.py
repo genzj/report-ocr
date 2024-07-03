@@ -156,7 +156,9 @@ def ocr_first_page(ocr: CnOcr, pdf: str | Path) -> list[OcrResult]:
     try:
         with pdf_first_page(pdf) as jpg:
             L.info("OCR scanning pdf %s", pdf)
-            return [OcrResult(**result) for result in ocr.ocr(jpg)]
+            return [
+                OcrResult(**result) for result in ocr.ocr(jpg, min_box_size=3)
+            ]
     except Exception:  # pylint: disable=broad-exception-caught
         L.exception("cannot OCR pdf %s", pdf)
         raise
@@ -265,9 +267,8 @@ def table_text_iter(
                 )
                 for cell in row
             ]
-            prev = r
-            row = [r]
-            continue
+            prev = TableOcrResult(-1, r.row_idx, OcrResult("", 0))
+            row = []
 
         while prev.col_idx < r.col_idx - 1:
             L.debug("filling between %s and %s", prev.col_idx, r.col_idx)
@@ -306,7 +307,7 @@ def ocr_to_csv(
                 row_tolerance=8,
                 column_tolerance=78,
             )
-            for row in table_text_iter(table_results, 0.3):
+            for row in table_text_iter(table_results, 0.325):
                 csv.writerow(row)
 
 
