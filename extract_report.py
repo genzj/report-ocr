@@ -1,6 +1,6 @@
 import logging
 from abc import ABC, abstractmethod
-from csv import reader, DictWriter
+from csv import DictWriter, reader
 from dataclasses import dataclass, field
 from logging import basicConfig, getLogger
 from pathlib import Path
@@ -30,8 +30,28 @@ class Report:
             return False
         return True
 
+    @staticmethod
+    def header() -> tuple[str, ...]:
+        return (
+            "文件名",
+            "登记号",
+            "姓名",
+            "性别",
+            "年龄",
+        )
 
-class InfoLineExtractor(ABC):
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "文件名": self.filename,
+            "登记号": self.registration_id,
+            "姓名": self.name,
+            "性别": self.gender,
+            "年龄": self.age,
+            **self.results,
+        }
+
+
+class LineExtractor(ABC):
     @abstractmethod
     def can_extract(self, csv_row: list[str]) -> bool:
         raise NotImplementedError()
@@ -41,16 +61,24 @@ class InfoLineExtractor(ABC):
         raise NotImplementedError
 
 
-class RegexExtractor(InfoLineExtractor):
+class RegexExtractor(LineExtractor):
     PATTERN = compile_re(r"")
     QUICK_TAG = "xxxxxxxxxxx"
 
     @classmethod
     def pattern(cls) -> Pattern:
+        if cls.PATTERN is RegexExtractor.PATTERN:
+            raise NotImplementedError(
+                "subclass should define PATTERN as a class property"
+            )
         return cls.PATTERN
 
     @classmethod
     def quick_tag(cls) -> str:
+        if cls.QUICK_TAG is RegexExtractor.QUICK_TAG:
+            raise NotImplementedError(
+                "subclass should define QUICK_TAG as a class property"
+            )
         return cls.QUICK_TAG
 
     def can_extract(self, csv_row: list[str]) -> bool:
@@ -61,7 +89,11 @@ class RegexExtractor(InfoLineExtractor):
         m = self.pattern().search(" ".join(csv_row))
         if m:
             return {k: v.strip() for k, v in m.groupdict().items()}
-        # TODO should be an internal error here
+        L.warning(
+            "%r didn't find any info from %r, its can_extract may be slack.",
+            self,
+            csv_row,
+        )
         return {}
 
 
@@ -79,79 +111,94 @@ class RegistrationIDExtractor(RegexExtractor):
     QUICK_TAG = "登记号"
 
 
+class ResultItemExtractor(LineExtractor):
+    def can_extract(self, csv_row: list[str]) -> bool:
+        return bool(
+            csv_row
+            and csv_row[0].strip()
+            and csv_row[0].strip()[0] in ascii_uppercase
+        )
+
+    def extract(self, csv_row: list[str]) -> dict[str, str]:
+        code_name_value = []
+        for col in csv_row:
+            col = col.strip()
+            if col:
+                code_name_value.append(col)
+            if len(code_name_value) == 3:
+                break
+        # item name isn't necesarry
+        item_code, _, item_value = code_name_value
+
+        # item value may contain space because of OCR inaccuracy
+        return {item_code: item_value.replace(" ", "")}
+
+
 INFO_EXTRACTORS = (NameGenderAgeExtractor(), RegistrationIDExtractor())
+RESULT_EXTRACTOR = ResultItemExtractor()
+
+
+def extract_info_into(report: Report, csv_row: list[str]) -> dict[str, str]:
+    for extractor in INFO_EXTRACTORS:
+        if not extractor.can_extract(csv_row):
+            continue
+
+        L.debug(
+            "row %s can be extracted by extractor %s",
+            csv_row,
+            extractor,
+        )
+        extracted = extractor.extract(csv_row)
+        L.debug("extracted %s", extracted)
+        break
+    else:
+        extracted = dict()
+
+    for k, v in extracted.items():
+        setattr(report, k, v)
+    return extracted
 
 
 def extract(file: Path | str) -> Report:
     file = Path(file)
+    L.info("processing file %s", file)
     report = Report(filename=file.name)
     with file.open("r", encoding="utf-8") as inf:
         csv = reader(inf)
         for csv_row in csv:
-            for extractor in INFO_EXTRACTORS:
-                if extractor.can_extract(csv_row):
-                    L.info(
-                        "row %s can be extracted by extractor %s",
-                        csv_row,
-                        extractor,
-                    )
-                    info = extractor.extract(csv_row)
-                    L.info("extracted %s", info)
-                    for k, v in info.items():
-                        setattr(report, k, v)
-                    continue
-            if (
-                csv_row
-                and csv_row[0].strip()
-                and csv_row[0].strip()[0] in ascii_uppercase
-            ):
-                item_code = csv_row[0].strip()
-                item_name = None
-                for col in csv_row[1:]:
-                    col = col.strip()
-                    if col and item_name:
-                        item_value = col.replace(" ", "")
-                        break
-                    elif col:
-                        item_name = col
-                else:
-                    item_value = ""
-
-                report.results[item_code] = item_value
-
+            if extract_info_into(report, csv_row):
+                # info row and result row are mutually exlusive so just move to
+                # next row and skip the result extractor when info can be extracted
+                continue
+            if RESULT_EXTRACTOR.can_extract(csv_row):
+                report.results.update(RESULT_EXTRACTOR.extract(csv_row))
     return report
 
 
 def extract_all(csv_dir: Path | str) -> list[Report]:
     csv_dir = Path(csv_dir)
-    reports = [extract(file) for file in csv_dir.glob("*.csv")]
+    reports = [
+        extract(file)
+        for file in csv_dir.glob("*.csv")
+        if file.is_fifo and "merge" not in file.name
+    ]
     return reports
 
 
 def merge_to_csv(reports: list[Report], output: Path | str):
-    item_codes = set()
+    # superset of all result codes
+    item_codes: set[str] = set()
     for report in reports:
         item_codes.update(report.results.keys())
-    header = [
-        "文件名",
-        "登记号",
-        "姓名",
-        "性别",
-        "年龄",
-    ] + list(item_codes)
+
+    header = Report.header() + tuple(item_codes)
+
     with Path(output).open("w", encoding="utf-8") as outf:
         csv_writer = DictWriter(outf, fieldnames=header)
         csv_writer.writeheader()
         csv_writer.writerows(
             map(
-                lambda report: {
-                    "文件名": report.filename,
-                    "登记号": report.registration_id,
-                    "姓名": report.name,
-                    "性别": report.gender,
-                    "年龄": report.age,
-                    **report.results,
-                },
+                Report.to_dict,
                 reports,
             )
         )
