@@ -313,8 +313,14 @@ def ocr_to_csv(
 
 if __name__ == "__main__":
     basicConfig(
+        handlers=(
+            logging.StreamHandler(),
+            logging.FileHandler(
+                "./report_ocr.log", mode="w", encoding="utf-8"
+            ),
+        ),
         level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s - %(funcName)s - %(levelname)s - %(message)s",
         force=True,
     )
     # ocr_to_txt()

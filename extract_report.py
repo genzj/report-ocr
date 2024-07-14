@@ -1,4 +1,5 @@
 import logging
+import typing
 from abc import ABC, abstractmethod
 from csv import DictWriter, reader
 from dataclasses import dataclass, field
@@ -175,14 +176,21 @@ def extract(file: Path | str) -> Report:
     return report
 
 
-def extract_all(csv_dir: Path | str) -> list[Report]:
+def extract_all(csv_dir: Path | str) -> typing.Iterable[Report]:
     csv_dir = Path(csv_dir)
-    reports = [
-        extract(file)
-        for file in csv_dir.glob("*.csv")
-        if file.is_fifo and "merge" not in file.name
-    ]
-    return reports
+    for file in csv_dir.glob("*.csv"):
+        if not file.is_file():
+            L.info("skip non-file path %s", file)
+            continue
+        if "merge" in file.name:
+            L.info("skip merged output %s", file)
+            continue
+        try:
+            report = extract(file)
+        except Exception as ex:
+            L.warning("cannot extract file %s", file, exc_info=ex)
+        else:
+            yield report
 
 
 def merge_to_csv(reports: list[Report], output: Path | str):
@@ -206,8 +214,15 @@ def merge_to_csv(reports: list[Report], output: Path | str):
 
 if __name__ == "__main__":
     basicConfig(
+        handlers=(
+            logging.StreamHandler(),
+            logging.FileHandler(
+                "./extract_report.log", mode="w", encoding="utf-8"
+            ),
+        ),
         level=logging.INFO,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s - %(funcName)s - %(levelname)s - %(message)s",
         force=True,
     )
-    merge_to_csv(extract_all("./output"), "./output/merge.csv")
+    reports = list(extract_all("./output"))
+    merge_to_csv(reports, "./output/merge.csv")
