@@ -100,7 +100,7 @@ class RegexExtractor(LineExtractor):
 
 class NameGenderAgeExtractor(RegexExtractor):
     PATTERN = compile_re(
-        r"姓名[：:](?P<name>.+?)\s+.*?性别[：:](?P<gender>.+?)\s+年龄[：:](?P<age>.+?)岁"
+        r"姓名[：:](?P<name>.+?)\s+.*?性\s*别[：:](?P<gender>.+?)\s+年龄[：:](?P<age>.+?)岁"
     )
 
     QUICK_TAG = "姓名"
@@ -178,7 +178,7 @@ def extract(file: Path | str) -> Report:
 
 def extract_all(csv_dir: Path | str) -> typing.Iterable[Report]:
     csv_dir = Path(csv_dir)
-    for file in csv_dir.glob("*.csv"):
+    for file in sorted(csv_dir.glob("*.csv")):
         if not file.is_file():
             L.info("skip non-file path %s", file)
             continue
