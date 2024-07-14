@@ -132,8 +132,16 @@ class LinearGrouper:
                 group_idx += 1
 
 
+@dataclass
+class OnePageOcrResult:
+    pnum: int
+    results: list[OcrResult]
+
+
 @contextmanager
-def pdf_first_page(pdf: str | Path) -> typing.Iterator[Path]:
+def pdf_images(
+    pdf: str | Path,
+) -> typing.Iterator[typing.Generator[Path, None, None]]:
     pdf = Path(pdf)
     try:
         with TemporaryDirectory(prefix="report_ocr_") as path:
@@ -142,22 +150,28 @@ def pdf_first_page(pdf: str | Path) -> typing.Iterator[Path]:
             convert_from_path(
                 pdf,
                 fmt="png",
-                single_file=True,
                 output_folder=path,
                 paths_only=True,
                 output_file=filename,
             )
-            yield Path(path) / Path(filename + ".png")
+            yield Path(path).glob("*.png")
     except Exception:  # pylint: disable=broad-exception-caught
         L.exception("cannot handle pdf %s", pdf)
 
 
-def ocr_first_page(ocr: CnOcr, pdf: str | Path) -> list[OcrResult]:
+def ocr_one_pdf(ocr: CnOcr, pdf: str | Path) -> list[OnePageOcrResult]:
     try:
-        with pdf_first_page(pdf) as jpg:
+        with pdf_images(pdf) as image_paths:
             L.info("OCR scanning pdf %s", pdf)
             return [
-                OcrResult(**result) for result in ocr.ocr(jpg, min_box_size=3)
+                OnePageOcrResult(
+                    pnum,
+                    [
+                        OcrResult(**result)
+                        for result in ocr.ocr(png, min_box_size=3)
+                    ],
+                )
+                for pnum, png in enumerate(image_paths, start=1)
             ]
     except Exception:  # pylint: disable=broad-exception-caught
         L.exception("cannot OCR pdf %s", pdf)
@@ -166,14 +180,14 @@ def ocr_first_page(ocr: CnOcr, pdf: str | Path) -> list[OcrResult]:
 
 def ocr_all_pdfs(
     data_dir: str | Path = "data",
-) -> typing.Iterator[tuple[Path, list[OcrResult]]]:
+) -> typing.Iterator[tuple[Path, list[OnePageOcrResult]]]:
     data_dir = Path(data_dir)
     if not data_dir.is_dir:
         raise ValueError("data_dir must be a dir")
 
     ocr_obj = CnOcr(DEFAULT_OCR_MODEL)
     for pdf in data_dir.glob("*.pdf"):
-        yield pdf, ocr_first_page(ocr_obj, pdf)
+        yield pdf, ocr_one_pdf(ocr_obj, pdf)
 
 
 def ensure_output_dir(output_dir: str | Path) -> Path:
@@ -191,10 +205,20 @@ def ocr_to_txt(
     L.info("OCR all pdf in %s and save text to %s", data_dir, output_dir)
     output_dir = ensure_output_dir(output_dir)
 
-    for pdf, results in ocr_all_pdfs(data_dir):
-        output_name = output_dir / Path(pdf.with_suffix(".txt").name)
-        with output_name.open("w", encoding="utf-8") as output:
-            output.writelines(str(result) + "\n" for result in results)
+    for pdf, pages in ocr_all_pdfs(data_dir):
+        for page in pages:
+            output_name = "{}_p{:04d}.txt".format(pdf.stem, page.pnum)
+            output_path = output_dir.joinpath(output_name)
+            L.info(
+                "save result of %s page %s into %s",
+                pdf,
+                page.pnum,
+                output_path,
+            )
+            with output_path.open("w", encoding="utf-8") as output:
+                output.writelines(
+                    str(result) + "\n" for result in page.results
+                )
 
 
 @dataclass
@@ -298,17 +322,25 @@ def ocr_to_csv(
     L.info("OCR all pdf in %s and save csv to %s", data_dir, output_dir)
     output_dir = ensure_output_dir(output_dir)
 
-    for pdf, results in ocr_all_pdfs(data_dir):
-        output_name = output_dir / Path(pdf.with_suffix(".csv").name)
-        with output_name.open("w", encoding="utf-8") as output:
-            csv = csv_writer(output)
-            table_results = table_layout(
-                results,
-                row_tolerance=8,
-                column_tolerance=78,
+    for pdf, pages in ocr_all_pdfs(data_dir):
+        for page in pages:
+            output_name = "{}_p{:04d}.csv".format(pdf.stem, page.pnum)
+            output_path = output_dir.joinpath(output_name)
+            L.info(
+                "save result of %s page %s into %s",
+                pdf,
+                page.pnum,
+                output_path,
             )
-            for row in table_text_iter(table_results, 0.325):
-                csv.writerow(row)
+            with output_path.open("w", encoding="utf-8") as output:
+                csv = csv_writer(output)
+                table_results = table_layout(
+                    page.results,
+                    row_tolerance=8,
+                    column_tolerance=78,
+                )
+                for row in table_text_iter(table_results, 0.325):
+                    csv.writerow(row)
 
 
 if __name__ == "__main__":
