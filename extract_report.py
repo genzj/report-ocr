@@ -3,6 +3,7 @@ import typing
 from abc import ABC, abstractmethod
 from csv import DictWriter, reader
 from dataclasses import dataclass, field
+from enum import Enum
 from logging import basicConfig, getLogger
 from pathlib import Path
 from re import Pattern
@@ -19,6 +20,7 @@ class Report:
     age: str = ""
     filename: str = ""
     registration_id: str = ""
+    examination_name: str = ""
     results: dict[str, str] = field(default_factory=dict)
 
     def validate(self, warn=True) -> bool:
@@ -39,6 +41,7 @@ class Report:
             "姓名",
             "性别",
             "年龄",
+            "医嘱名称",
         )
 
     def to_dict(self) -> dict[str, str]:
@@ -48,6 +51,7 @@ class Report:
             "姓名": self.name,
             "性别": self.gender,
             "年龄": self.age,
+            "医嘱名称": self.examination_name,
             **self.results,
         }
 
@@ -112,13 +116,15 @@ class RegistrationIDExtractor(RegexExtractor):
     QUICK_TAG = "登记号"
 
 
+class ExaminationNameExtractor(RegexExtractor):
+    PATTERN = compile_re(r"医嘱名称[：:]\s*(?P<examination_name>\S+)")
+
+    QUICK_TAG = "医嘱名称"
+
+
 class ResultItemExtractor(LineExtractor):
     def can_extract(self, csv_row: list[str]) -> bool:
-        return bool(
-            csv_row
-            and csv_row[0].strip()
-            and csv_row[0].strip()[0] in ascii_uppercase
-        )
+        return len(list(filter(lambda col: bool(col.strip()), csv_row))) >= 2
 
     def extract(self, csv_row: list[str]) -> dict[str, str]:
         code_name_value = []
@@ -128,15 +134,71 @@ class ResultItemExtractor(LineExtractor):
                 code_name_value.append(col)
             if len(code_name_value) == 3:
                 break
-        # item name isn't necesarry
-        item_code, _, item_value = code_name_value
+        if (
+            len(code_name_value) == 3
+            and code_name_value[0][0].upper() in ascii_uppercase
+        ):
+            # 3 items and the first column begins with letter, indicating a item
+            # code; item name isn't necesarry in this case
+            item_code, _, item_value = code_name_value
+        else:
+            # use the first two columns, although the first column is
+            # actually item name (usually in Chinese)
+            item_code, item_value = code_name_value[:2]
 
         # item value may contain space because of OCR inaccuracy
         return {item_code: item_value.replace(" ", "")}
 
 
-INFO_EXTRACTORS = (NameGenderAgeExtractor(), RegistrationIDExtractor())
+INFO_EXTRACTORS = (
+    NameGenderAgeExtractor(),
+    RegistrationIDExtractor(),
+    ExaminationNameExtractor(),
+)
+RESULT_HEADER_TAGS = ("项目", "结果")
+RESULT_ENDING_TAGS = ("医嘱时间", "采样时间")
 RESULT_EXTRACTOR = ResultItemExtractor()
+
+
+def has_all_tags(csv_row: list[str], tags: typing.Iterable[str]) -> bool:
+    row = " ".join(csv_row)
+    return all(
+        map(
+            lambda s: s in row,
+            tags,
+        )
+    )
+
+
+class ReportSection(Enum):
+    INFO = 1
+    REPORT = 2
+    FOOTER = 3
+
+    def calculate_section(
+        self, csv_row: list[str]
+    ) -> tuple[bool, "ReportSection"]:
+        if has_all_tags(csv_row, RESULT_HEADER_TAGS):
+            if self is not ReportSection.INFO:
+                L.warning(
+                    "found another header after section %s: %s",
+                    self.name,
+                    csv_row,
+                )
+            return True, ReportSection.REPORT
+        if has_all_tags(csv_row, RESULT_ENDING_TAGS):
+            if self is ReportSection.INFO:
+                L.warning(
+                    "found footer after section %s: %s", self.name, csv_row
+                )
+            if self is ReportSection.FOOTER:
+                L.warning(
+                    "found another footer after section %s: %s",
+                    self.name,
+                    csv_row,
+                )
+            return True, ReportSection.FOOTER
+        return False, self
 
 
 def extract_info_into(report: Report, csv_row: list[str]) -> dict[str, str]:
@@ -166,13 +228,22 @@ def extract(file: Path | str) -> Report:
     report = Report(filename=file.name)
     with file.open("r", encoding="utf-8") as inf:
         csv = reader(inf)
+        section: ReportSection = ReportSection.INFO
+
         for csv_row in csv:
-            if extract_info_into(report, csv_row):
-                # info row and result row are mutually exlusive so just move to
-                # next row and skip the result extractor when info can be extracted
-                continue
-            if RESULT_EXTRACTOR.can_extract(csv_row):
-                report.results.update(RESULT_EXTRACTOR.extract(csv_row))
+            new_section, section = section.calculate_section(csv_row)
+            match [new_section, section]:
+                case [_, ReportSection.INFO]:
+                    extract_info_into(report, csv_row)
+                case [True, ReportSection.REPORT]:
+                    L.debug("found report header")
+                case [False, ReportSection.REPORT]:
+                    if RESULT_EXTRACTOR.can_extract(csv_row):
+                        report.results.update(
+                            RESULT_EXTRACTOR.extract(csv_row)
+                        )
+                case [_, ReportSection.FOOTER]:
+                    break
     return report
 
 
